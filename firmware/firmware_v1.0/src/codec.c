@@ -62,19 +62,18 @@ static volatile int64_t last_voice_ms = 0;
 
 static bool frame_has_voice(int16_t *samples, size_t n)
 {
+    // RMS energy check: less sensitive to single-sample spikes than a
+    // pure peak threshold. Compares mean square against threshold^2 to
+    // avoid sqrt() on the MCU.
+    int64_t sum_sq = 0;
     for (size_t i = 0; i < n; i++)
     {
         int32_t s = samples[i];
-        if (s < 0)
-        {
-            s = -s;
-        }
-        if (s > VOICE_THRESHOLD)
-        {
-            return true;
-        }
+        sum_sq += (int64_t)s * (int64_t)s;
     }
-    return false;
+    int64_t mean_sq = sum_sq / (int64_t)n;
+    int64_t thresh_sq = (int64_t)VOICE_RMS_THRESHOLD * (int64_t)VOICE_RMS_THRESHOLD;
+    return mean_sq > thresh_sq;
 }
 
 bool voice_is_active(void)

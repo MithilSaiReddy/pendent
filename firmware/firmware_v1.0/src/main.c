@@ -74,7 +74,7 @@ int main(void)
 	while (1)
 	{
 		set_led_state();
-		k_msleep(500);
+		k_msleep(100);
 	}
 
 	// Unreachable

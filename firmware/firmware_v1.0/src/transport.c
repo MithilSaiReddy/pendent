@@ -311,6 +311,14 @@ static bool write_to_tx_queue(uint8_t *data, size_t size)
     }
 }
 
+static void drop_oldest_tx_frame(void)
+{
+    uint8_t discard[CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE];
+    ring_buf_get(&ring_buf, discard, sizeof(discard));
+}
+
+static uint32_t dropped_tx_frames = 0;
+
 static bool read_from_tx_queue()
 {
 
@@ -348,16 +356,26 @@ static bool push_to_gatt(struct bt_conn *conn)
     }
 
     // Push each frame
+    // Effective payload is limited by both link-layer tx len and GATT ATT MTU.
+    uint16_t att_mtu = bt_gatt_get_mtu(conn);
+    uint16_t effective_mtu = MIN(current_mtu, att_mtu);
+    if (effective_mtu <= NET_BUFFER_HEADER_SIZE)
+    {
+        return false;
+    }
+    uint32_t max_payload = effective_mtu - NET_BUFFER_HEADER_SIZE;
+    uint16_t frame_id = packet_next_index++;
     uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint32_t offset = 0;
     uint8_t index = 0;
     while (offset < tx_buffer_size)
     {
-        // Recombine packet
-        uint32_t id = packet_next_index++;
-        uint32_t packet_size = MIN(current_mtu - NET_BUFFER_HEADER_SIZE, tx_buffer_size - offset);
-        pusher_temp_data[0] = id & 0xFF;
-        pusher_temp_data[1] = (id >> 8) & 0xFF;
+        // Recombine packet: same frame_id for all fragments of one
+        // codec frame, frag index marks the order. A new frame starts
+        // with index 0 so the client can find frame boundaries.
+        uint32_t packet_size = MIN(max_payload, tx_buffer_size - offset);
+        pusher_temp_data[0] = frame_id & 0xFF;
+        pusher_temp_data[1] = (frame_id >> 8) & 0xFF;
         pusher_temp_data[2] = index;
         memcpy(pusher_temp_data + NET_BUFFER_HEADER_SIZE, buffer + offset, packet_size);
         offset += packet_size;
@@ -437,6 +455,10 @@ void pusher(void)
             {
                 k_sleep(K_MSEC(50));
             }
+            else
+            {
+                k_yield();
+            }
         }
 
         if (conn)
@@ -496,6 +518,11 @@ int transport_start()
     ring_buf_init(&ring_buf, sizeof(tx_queue), tx_queue);
     k_thread_create(&pusher_thread, pusher_stack, K_THREAD_STACK_SIZEOF(pusher_stack), (k_thread_entry_t)pusher, NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
 
+    // Start battery reporting even before a connection exists; the
+    // handler reschedules itself and bt_bas_set_battery_level() simply
+    // fails while disconnected.
+    k_work_schedule(&battery_work, K_MSEC(1000));
+
     return 0;
 }
 
@@ -531,9 +558,19 @@ bool transport_is_streaming(void)
 
 int broadcast_audio_packets(uint8_t *buffer, size_t size)
 {
-    while (!write_to_tx_queue(buffer, size))
+    // Non-blocking: if the queue is full, drop the oldest frame to make
+    // room instead of stalling the codec thread forever.
+    if (!write_to_tx_queue(buffer, size))
     {
-        k_sleep(K_MSEC(1));
+        drop_oldest_tx_frame();
+        dropped_tx_frames++;
+#ifdef LOG_DISCARDED
+        printk("TX queue full, dropped frame %u\n", dropped_tx_frames);
+#endif
+        if (!write_to_tx_queue(buffer, size))
+        {
+            return -ENOMEM;
+        }
     }
     return 0;
 }

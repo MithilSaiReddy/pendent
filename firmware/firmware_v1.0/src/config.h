@@ -40,8 +40,8 @@
 #endif
 #define CONFIG_OPUS_MODE CONFIG_OPUS_MODE_CELT
 
-// Voice detection (simple peak threshold per 10ms frame)
-#define VOICE_THRESHOLD 800
+// Voice detection (RMS threshold per 10ms frame)
+#define VOICE_RMS_THRESHOLD 350
 #define VOICE_HANGOVER_MS 1000
 
 // Codec IDs

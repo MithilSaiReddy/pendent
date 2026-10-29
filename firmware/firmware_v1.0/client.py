@@ -3,24 +3,28 @@ import bleak
 from bleak import BleakClient
 import wave
 from datetime import datetime
-import numpy as np
-import time
 import os
-import struct
-from scipy.signal import stft, istft
 
 DEVICE_NAME = "Tanu"
 SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214"
 CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
 
-CODEC = "pcm"  # "pcm" or "mulaw" 
-SAMPLE_RATE = 8000  # Sample rate for the audio
+CODEC = "opus"  # "opus" (firmware default, ID 20), "pcm" or "mulaw" for legacy firmware
+SAMPLE_RATE = 16000  # Firmware encodes at 16 kHz
 SAMPLE_WIDTH = 2  # 16-bit audio
 CHANNELS = 1  # Mono audio
 CAPTURE_TIME = 10  # Time to capture audio in seconds
+OPUS_FRAME_SAMPLES = 160  # 10 ms @ 16 kHz
+
+try:
+    from opuslib import Decoder as OpusDecoder
+    HAS_OPUSLIB = True
+except ImportError:
+    HAS_OPUSLIB = False
+
 
 def ulaw2linear(ulaw_byte):
-    """Convert a µ-law byte to a 16-bit linear PCM value."""
+    """Convert a mu-law byte to a 16-bit linear PCM value."""
     EXPONENT_LUT = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
     ulaw_byte = ~ulaw_byte
     sign = (ulaw_byte & 0x80)
@@ -29,15 +33,95 @@ def ulaw2linear(ulaw_byte):
     sample = EXPONENT_LUT[exponent] + (mantissa << (exponent + 3))
     if sign != 0:
         sample = -sample
-    
     return sample
 
-def ulaw_bytes_to_pcm16(ulaw_data):
-    """Convert a sequence of µ-law encoded bytes to a list of 16-bit PCM values."""
-    return [ulaw2linear(byte) for byte in ulaw_data]
+
+class FrameReassembler:
+    """Reassemble codec frames from BLE notifications.
+
+    Notify layout (see src/transport.c): [frame_id_lo, frame_id_hi,
+    frag_index, payload...]. A new codec frame always starts with
+    frag_index 0, possibly split across fragments with index 1, 2, ...
+    """
+
+    def __init__(self):
+        self.frames = []
+        self.current = bytearray()
+        self.expected_index = 0
+        self.started = False
+        self.lost_fragments = 0
+        self.lost_frames = 0
+
+    def feed(self, data):
+        if len(data) < 3:
+            self.lost_fragments += 1
+            return
+        frag_index = data[2]
+        payload = data[3:]
+        if frag_index == 0:
+            if self.started and len(self.current) > 0:
+                self.frames.append(bytes(self.current))
+            self.current = bytearray(payload)
+            self.expected_index = 1
+            self.started = True
+        else:
+            if not self.started:
+                self.lost_frames += 1
+                return
+            if frag_index != self.expected_index:
+                self.lost_fragments += 1
+            self.current.extend(payload)
+            self.expected_index = frag_index + 1
+
+    def flush(self):
+        if self.started and len(self.current) > 0:
+            self.frames.append(bytes(self.current))
+        self.current = bytearray()
+        self.started = False
+        self.expected_index = 0
+
+
+def decode_opus_frames(frames):
+    if not HAS_OPUSLIB:
+        return None
+    decoder = OpusDecoder(SAMPLE_RATE, CHANNELS)
+    pcm = bytearray()
+    for frame in frames:
+        try:
+            pcm.extend(decoder.decode(frame, OPUS_FRAME_SAMPLES))
+        except Exception as e:
+            print(f"Opus decode failed for {len(frame)}-byte frame: {e}")
+            return None
+    return bytes(pcm)
+
+
+def export_wav(pcm_bytes, prefix="recording"):
+    recordings_dir = "recordings"
+    os.makedirs(recordings_dir, exist_ok=True)
+    filename = os.path.join(recordings_dir, datetime.now().strftime("%H-%M-%S-%f") + ".wav")
+    with wave.open(filename, "wb") as wav_file:
+        wav_file.setnchannels(CHANNELS)
+        wav_file.setsampwidth(SAMPLE_WIDTH)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(pcm_bytes)
+    print(f"Wrote {filename} ({len(pcm_bytes)} bytes PCM)")
+    return filename
+
+
+def export_opus_frames(frames, prefix="recording"):
+    recordings_dir = "recordings"
+    os.makedirs(recordings_dir, exist_ok=True)
+    filename = os.path.join(recordings_dir, datetime.now().strftime("%H-%M-%S-%f") + ".opus.frames")
+    with open(filename, "wb") as f:
+        for frame in frames:
+            f.write(len(frame).to_bytes(2, "little"))
+            f.write(frame)
+    print(f"Wrote {filename} ({len(frames)} Opus frames, install 'opuslib' to decode to WAV)")
+    return filename
+
 
 async def main():
-    print("Discovering AudioRecorder...")
+    print("Discovering Tanu...")
     devices = await bleak.discover(timeout=2.0)
     audio_recorder = None
     for device in devices:
@@ -46,108 +130,65 @@ async def main():
         if device.name == DEVICE_NAME:
             audio_recorder = device
             break
-    
+
     if not audio_recorder:
-        print("AudioRecorder not found")
+        print("Device not found")
         return
+
     def handle_ble_disconnect(client):
-        print("Disconnected from AudioRecorder")
+        print("Disconnected from device")
 
-    # def ulawToLinear(ulawByte):
-    #     ulawByte = ~ulawByte & 0xFF  # Invert and mask to 8-bit
-    #     sign = (ulawByte & 0x80)
-    #     exponent = (ulawByte >> 4) & 0x07
-    #     mantissa = ulawByte & 0x0F
-    #     sample = (0x80 + (mantissa << 4)) << max(0, exponent - 1)
-    #     sample -= 0x84 << 2  # Adjusting back the bias used during encoding
-    
-    #     if sign == 0:
-    #         sample = -sample
-    
-    #     # Adjust output to fit into 16-bit PCM range
-    #     return sample & 0xFFFF
-
-    def filter_audio_data(audio_data):
-        
-        if CODEC == "mulaw":
-            # pcm16_samples = audioop.ulaw2lin(audio_data, 2)
-            # pcm16_samples = struct.unpack('<' + 'h' * (len(pcm16_samples) // 2), pcm16_samples)
-            # print(pcm16_samples)
-            pcm16_samples = ulaw_bytes_to_pcm16(audio_data)
-            audio_data = np.array(pcm16_samples, dtype=np.int16)
-
-        if CODEC == "pcm":
-            audio_data = audio_data[:len(audio_data) - len(audio_data) % 2]
-            audio_data = np.frombuffer(audio_data, dtype=np.int16)
-        
-        # Normalize
-        # scaling_factor = 2*32768 / (max(0, np.max(audio_data)) - min(0, np.min(audio_data)))
-        # return (audio_data * scaling_factor).astype(np.int16)
-        return audio_data
-    
-    def export_audio_data(filtered_audio_data, raw_file, file_extension):
-        recordings_dir = "recordings"
-        if not os.path.exists(recordings_dir):
-            os.makedirs(recordings_dir)
-        filename = os.path.join(recordings_dir, datetime.now().strftime("%H-%M-%S-%f") + file_extension)
-        print(filename)
-        # filename = os.path.join(recordings_dir, "recording" + file_extension)
-        if file_extension == ".txt":
-            with open(filename, "w") as file:
-                file.write(str(list(raw_file)))
-        else:
-            # Directly use the filename with wave.open for .wav files
-            with wave.open(filename, "wb") as wav_file:
-                wav_file.setnchannels(CHANNELS)
-                wav_file.setsampwidth(SAMPLE_WIDTH)
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(filtered_audio_data.tobytes())  # Ensure data is in bytes format
-
-
-    async def process_audio(audio_data):
-        if len(audio_data) == 0:
-            print("Warning: Received empty audio data array.")
-            return
-            
-        filtered_audio_data = filter_audio_data(audio_data)
-        export_audio_data(filtered_audio_data, audio_data, ".wav")
-        export_audio_data(filtered_audio_data, audio_data, ".txt")
-        pass
-
-    async with BleakClient(audio_recorder.address, services=[SERVICE_UUID], disconnect_callback=handle_ble_disconnect) as client:
-        print("Connected to AudioRecorder")
+    async with BleakClient(audio_recorder.address, services=[SERVICE_UUID],
+                           disconnect_callback=handle_ble_disconnect) as client:
+        print("Connected to device")
         services = await client.get_services()
         audio_service = services.get_service(SERVICE_UUID)
         audio_characteristic = audio_service.get_characteristic(CHARACTERISTIC_UUID)
 
-        audio_data = bytearray()
-        # end_signal = b"\xFF"
+        reassembler = FrameReassembler()
 
         def handle_audio_data(sender, data):
-            # print("---handle_audio_data---")
-            # print(f"Received {len(data)} bytes at {time.time()}")
-            audio_data.extend(data[3:])
-            # if data == [end_signal]:
-            #     print(f"End signal received after {len(audio_data)} bytes")
-            
+            reassembler.feed(bytes(data))
 
         async def record_audio():
+            reassembler.frames.clear()
+            reassembler.flush()
             await client.start_notify(audio_characteristic.uuid, handle_audio_data)
             print("Recording audio...")
             await asyncio.sleep(CAPTURE_TIME)
-            print("Recording stopped")
             await client.stop_notify(audio_characteristic.uuid)
-        
+            reassembler.flush()
+            print(f"Recording stopped: {len(reassembler.frames)} frames, "
+                  f"lost fragments={reassembler.lost_fragments}")
+
         async def record_and_process():
             while True:
                 await record_audio()
-                print(len(audio_data))
-                asyncio.ensure_future(process_audio(audio_data.copy()))
-                audio_data.clear()
-                
+                frames = list(reassembler.frames)
+                reassembler.frames.clear()
+                if not frames:
+                    print("Warning: no audio frames received.")
+                    continue
+                if CODEC == "opus":
+                    pcm = decode_opus_frames(frames)
+                    if pcm is not None:
+                        export_wav(pcm)
+                    else:
+                        if not HAS_OPUSLIB:
+                            print("opuslib not installed: saving raw Opus frames. pip install opuslib")
+                        export_opus_frames(frames)
+                elif CODEC == "mulaw":
+                    import numpy as np
+                    raw = b"".join(frames)
+                    pcm16 = [ulaw2linear(b) for b in raw]
+                    export_wav(np.array(pcm16, dtype=np.int16).tobytes())
+                else:  # pcm
+                    import numpy as np
+                    raw = b"".join(frames)
+                    raw = raw[:len(raw) - len(raw) % 2]
+                    export_wav(np.frombuffer(raw, dtype=np.int16).tobytes())
+
         await record_and_process()
-        
-        # await record_audio()
-        
-  
+
+
 asyncio.run(main())
